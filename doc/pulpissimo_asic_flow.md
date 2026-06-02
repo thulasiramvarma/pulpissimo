@@ -2392,5 +2392,537 @@ TOP SYNTHESIS
 
 ---
 
-*Document version 0.4 — Last updated: 2026-06-02*
+## Custom IP Integration — Crypto Subsystem + OTP {#crypto}
+
+### Overview
+
+Six security IPs are added as a unified **Crypto Subsystem** block, instantiated inside
+`soc_domain.sv` and controlled via the APB peripheral bus. The subsystem also contains an
+8 kbit analog OTP hard macro with a synthesizable digital controller.
+
+```
+soc_domain.sv
+└── i_crypto_subsystem  (hw/crypto_subsystem/crypto_subsystem.sv)
+    ├── i_aes256        AES-256 enc/dec  + uDMA FIFO interface
+    ├── i_sha256        SHA-256 hash     + uDMA FIFO interface
+    ├── i_ecc521        ECC P-521        register-driven only
+    ├── i_pqc           Kyber-1024 KEM   + uDMA FIFO interface + NTT SRAM macro
+    ├── i_trng          TRNG (analog RO + AES-CTR DRBG), register-driven
+    └── i_otp_ctrl      OTP controller   + otp_8kb_macro (analog hard IP)
+```
+
+---
+
+### A. Corrected SoC Address Map
+
+Reading `hw/includes/soc_mem_map.svh` shows `0x1A12_0000` is **already reserved** for
+the Chip Control region (FLL/clock config and pad mux config). The crypto window is
+placed after the Chip Control region ends:
+
+```
+0x1A12_0000 – 0x1A12_1000   CHIP_CTRL: FLL / clock_gen APB config  (existing)
+0x1A12_1000 – 0x1A12_2000   CHIP_CTRL: pad multiplexer config       (existing)
+0x1A12_0000 – 0x1A14_0000   CHIP_CTRL reserved region               (existing)
+
+0x1A14_0000 – 0x1A18_0000   CRYPTO SUBSYSTEM  ← NEW (256 KB window)
+  0x1A14_0000 – 0x1A14_0FFF   AES-256          APB control
+  0x1A14_1000 – 0x1A14_1FFF   SHA-256          APB control
+  0x1A14_2000 – 0x1A14_2FFF   ECC-521 (P-521)  APB control
+  0x1A14_3000 – 0x1A14_3FFF   PQC Kyber-1024   APB control
+  0x1A14_4000 – 0x1A14_4FFF   TRNG             APB control
+  0x1A14_5000 – 0x1A14_5FFF   OTP controller   APB control/status only
+```
+
+Files to edit:
+
+```systemverilog
+// hw/includes/soc_mem_map.svh  — add:
+`define SOC_MEM_MAP_CRYPTO_START_ADDR  32'h1A14_0000
+`define SOC_MEM_MAP_CRYPTO_END_ADDR    32'h1A18_0000
+
+// hw/includes/periph_bus_defines.sv  — change:
+`define NB_MASTER  12   // was 11
+
+`define CRYPTO_START_ADDR  32'h1A14_0000
+`define CRYPTO_END_ADDR    32'h1A18_0000
+```
+
+---
+
+### B. TCDM Interconnect — Corrected Architecture
+
+The central SoC fabric is **`soc_interconnect`** (inside `pulp_soc`), which is **not** a
+single AXI crossbar. It is three fabrics fused together:
+
+```
+soc_interconnect
+├── ① Interleaved crossbar  =  TCDM INTERCONNECT (logarithmic, single-cycle)
+│      word-interleaved → 4 L2 banks;  addr[3:2] selects bank
+│      protocol: lint (req/gnt/add/wdata/be/r_rdata/r_valid)  NOT AXI
+│
+├── ② Contiguous crossbar   →  private banks + boot ROM + APB bridge
+│
+└── ③ AXI plug              →  cluster port (tied off in PULPissimo)
+```
+
+TCDM masters and the address range they reach:
+
+```
+Masters feeding the interleaved crossbar:
+  ① FC core — instruction fetch
+  ② FC core — data load/store
+  ③ uDMA   — TX (L2 → peripheral)
+  ④ uDMA   — RX (peripheral → L2)
+  ⑤ Debug module
+  ⑥ HWPE (when USE_HWPE=1)
+  ⑦ CRYPTO direct port (optional — high-BW path for AES/PQC)
+
+L2 banks (slaves) @ 0x1C01_0000 – 0x1C09_0000:
+  Bank 0 (112 KB)  — addr[3:2] = 2'b00
+  Bank 1 (112 KB)  — addr[3:2] = 2'b01
+  Bank 2 (112 KB)  — addr[3:2] = 2'b10
+  Bank 3 (112 KB)  — addr[3:2] = 2'b11
+```
+
+---
+
+### C. IP Characterization
+
+| IP | Operation | Latency @ 200 MHz | Data size | DMA path | ASIC concern |
+|---|---|---|---|---|---|
+| **AES-256** | Enc + Dec (CBC/GCM) | ~20 cycles/block | 16 B blocks, bulk buffers | uDMA channel or direct TCDM | Side-channel: isolated power rail |
+| **SHA-256** | Hash (streaming) | ~70 cycles/512-bit block | Variable message | uDMA channel | None — standard cells |
+| **ECC-521** | P-521 point multiply | ~1.5 M cycles | 66 B operands | **None — register only** | 521-bit multiplier ~0.3 mm²; MCP=8 |
+| **PQC Kyber-1024** | KEM enc/dec | ~50 K–500 K cycles | 1.6 KB keys, 1.6 KB CT | uDMA channel or direct TCDM | NTT SRAM 2 KB macro inside |
+| **TRNG** | RO entropy + AES-CTR DRBG | Continuous trickle | 32-bit words on demand | **None — register only** | Foundry RO cell; DFT bypass |
+| **OTP (8 kbit)** | One-time program/read | 10–50 ns read | 256 × 32-bit words | **None — register only** | Analog hard macro; VPP pad; key never on APB |
+
+**Why ECC-521 and TRNG have no DMA:**
+
+- ECC-521: input is 6 APB register writes (198 bytes), output is 4 reads (132 bytes).
+  The 1.5 M-cycle compute time dominates; DMA overhead for 200 B is zero benefit.
+- TRNG: entropy output rate (~1–4 MB/s after health checks) is far below what DMA
+  is designed for. Firmware reads 32-bit words on interrupt; DRBG seed needs ~8 reads total.
+
+**DMA vs. direct TCDM for AES/PQC:**
+
+| Path | Effort | Bandwidth | When to use |
+|---|---|---|---|
+| uDMA channel | Low — `udma_cfg_pkg` +3 | Shared, FIFO-paced | SHA (compute-bound per block) |
+| Direct TCDM master ⑦ | High — fork `soc_interconnect`, add lint port | Single-cycle, dedicated | AES bulk CBC/GCM, PQC NTT |
+
+---
+
+### D. Crypto Subsystem RTL Structure
+
+#### `crypto_subsystem.sv` interface
+
+```systemverilog
+module crypto_subsystem #(
+  parameter int unsigned APB_ADDR_WIDTH = 32
+)(
+  input  logic       clk_i,
+  input  logic       rst_ni,
+  input  logic       test_en_i,          // DFT scan enable
+  input  logic       debug_mode_i,       // zeros OTP key outputs when debug active
+  APB.Slave          apb_slave,          // control @ 0x1A14_0000
+
+  // uDMA FIFO interfaces (AES, SHA, PQC only — ECC/TRNG/OTP have none)
+  output logic [31:0] aes_tx_data_o,  output logic aes_tx_valid_o,  input  logic aes_tx_ready_i,
+  input  logic [31:0] aes_rx_data_i,  input  logic aes_rx_valid_i,  output logic aes_rx_ready_o,
+  output logic [31:0] sha_tx_data_o,  output logic sha_tx_valid_o,  input  logic sha_tx_ready_i,
+  input  logic [31:0] sha_rx_data_i,  input  logic sha_rx_valid_i,  output logic sha_rx_ready_o,
+  output logic [31:0] pqc_tx_data_o,  output logic pqc_tx_valid_o,  input  logic pqc_tx_ready_i,
+  input  logic [31:0] pqc_rx_data_i,  input  logic pqc_rx_valid_i,  output logic pqc_rx_ready_o,
+
+  // Interrupts to SoC event unit (one per IP)
+  output logic [5:0]  crypto_irq_o    // [0]=AES [1]=SHA [2]=ECC [3]=PQC [4]=TRNG [5]=OTP
+);
+```
+
+Internal structure:
+- **6-way APB demux** on `apb_slave.paddr[14:12]` routes to each IP
+- **Per-IP ICG** via `tc_clk_gating` — leakage reduced when IP idle
+- **Private key bus** from OTP controller directly to AES/ECC (never on APB)
+
+```systemverilog
+// Private key bus — NEVER exposed to APB
+logic [255:0] otp_root_key;    // → AES-256 key input
+logic [255:0] otp_device_key;  // → ECC-521 private key input
+logic         otp_keys_valid;
+```
+
+#### PQC NTT SRAM macro
+
+Kyber-1024 parameters: k=4 polynomials, n=256 coefficients, q=3329 (12-bit).
+Working buffer: 4 × 256 × 12 bits = 12,288 bits = **1,536 bytes → 2 KB macro**.
+
+```systemverilog
+// Inside pqc_top.sv — instantiate foundry 2 KB SRAM macro
+sram_256x64 i_ntt_buf (    // foundry macro: depth=256, width=64 (8 coefficients/word)
+  .clk_i   ( clk_i          ),
+  .we_i    ( ntt_buf_we      ),
+  .addr_i  ( ntt_buf_addr    ),  // [7:0]
+  .wdata_i ( ntt_buf_wdata   ),  // [63:0]
+  .rdata_o ( ntt_buf_rdata   )
+);
+```
+
+Key/ciphertext live in L2 (not in this macro):
+
+```
+Public key:    1568 bytes  — in L2, streamed in via uDMA
+Secret key:    3168 bytes  — in L2, streamed in via uDMA
+Ciphertext:    1568 bytes  — written to L2 via uDMA
+Shared secret:   32 bytes  — written to L2 via uDMA
+```
+
+---
+
+### E. OTP — Analog Hard Macro Integration
+
+The 8 kbit OTP is a **custom analog IP** (not synthesizable RTL). Integration differs
+fundamentally from the digital crypto IPs.
+
+#### Four views required from the analog team
+
+| View | File | Used by | Purpose |
+|---|---|---|---|
+| Behavioral model | `otp_8kb.v` | QuestaSim | Functional sim at digital boundary |
+| Liberty | `otp_8kb.lib` | Genus, Innovus, PrimeTime | Digital pin timing |
+| LEF | `otp_8kb.lef` | Innovus | Abstract footprint + pin locations |
+| GDS | `otp_8kb.gds` | Final tapeout | Real layout merged at tapeout |
+
+Analog pins (VPP, VREF) have **no Liberty timing** — they are declared in UPF as a
+separate power domain and routed manually (not by the digital router).
+
+#### Dedicated analog pads — bypass Padrick
+
+The OTP macro needs high-voltage pads that must **not** go through the Padrick-generated
+padframe:
+
+```systemverilog
+// hw/pulpissimo.sv — add dedicated pads (outside the Padrick padframe)
+inout wire  pad_otp_vpp,    // programming voltage (1.8V–7V, technology-dependent)
+inout wire  pad_otp_vref,   // sense-amp reference voltage
+```
+
+Route these straight down the hierarchy:
+`pulpissimo.sv → soc_domain.sv → crypto_subsystem.sv → otp_ctrl.sv → otp_8kb_macro`
+
+The digital router must not touch these nets; declare them as **analog nets** in UPF.
+
+#### OTP controller port interface
+
+```systemverilog
+// hw/crypto_subsystem/otp/otp_ctrl.sv
+module otp_ctrl (
+  input  logic        clk_i,
+  input  logic        rst_ni,
+  input  logic        test_en_i,
+  input  logic        debug_mode_i,    // forces key outputs to zero when high
+  APB.Slave           apb,             // control/status only — NO key readback
+
+  // Private key outputs — direct to AES/ECC datapaths, never on APB
+  output logic [255:0] root_key_o,
+  output logic [255:0] device_key_o,
+  output logic         keys_valid_o,
+
+  // Digital pins to the analog macro
+  output logic [7:0]   otp_addr_o,
+  output logic [31:0]  otp_din_o,
+  input  logic [31:0]  otp_dout_i,
+  output logic         otp_ceb_o,      // chip enable (active low)
+  output logic         otp_web_o,      // write enable (active low)
+  output logic         otp_readen_o,
+  output logic         otp_prog_o      // gates VPP path (only high during programming)
+);
+```
+
+```systemverilog
+// hw/crypto_subsystem/otp/otp_8kb_macro.sv — BLACK BOX port declaration
+// Genus reads this as a hard macro via .lib/.lef; behavioral .v used in sim
+module otp_8kb_macro (
+  input  logic        CLK,
+  input  logic [7:0]  A,
+  input  logic [31:0] DIN,
+  output logic [31:0] DOUT,
+  input  logic        CEB,
+  input  logic        WEB,
+  input  logic        READEN,
+  inout  wire         VPP,     // analog — route to pad_otp_vpp
+  inout  wire         VREF     // analog — route to pad_otp_vref
+);
+endmodule
+```
+
+#### Programming voltage domain
+
+```
+Core logic:   VDD      = 0.8V   (soc_clk domain)
+OTP read:     VDD_OTP  = 0.8V or 1.8V  (technology-dependent)
+OTP program:  VPP      = 1.8V – 7V     (high-voltage, dedicated pad + ESD)
+```
+
+VPP must be declared as a **separate power domain in UPF/CPF**. VPP pad must have
+HV-rated ESD protection. If an on-chip charge pump is used, it is part of the analog
+IP and needs its own placement + supply routing.
+
+#### Security — key path must not traverse the APB bus
+
+```
+WRONG:  OTP → APB bus → CPU → APB bus → AES key register
+        (any bus master or JTAG debugger can read the key)
+
+CORRECT: OTP → private internal bus → AES key register (hardwired inside
+         crypto_subsystem.sv; key never appears on a CPU-readable bus)
+```
+
+Hardware lockouts required:
+- **Read-lock fuse**: after provisioning, blow a fuse that permanently disables
+  APB readback of key words
+- **Debug isolation**: when `debug_mode_i` is high (JTAG active), force all key
+  outputs to zero — prevents key extraction via debugger
+
+#### APB registers (OTP controller — `0x1A14_5000`)
+
+| Offset | Name | Access | Description |
+|---|---|---|---|
+| `0x00` | `OTP_CTRL` | R/W | `[0]` START program, `[1]` START read, `[2]` key_load |
+| `0x04` | `OTP_STATUS` | RO | `[0]` BUSY, `[1]` DONE, `[2]` ERROR, `[3]` KEY_VALID |
+| `0x08` | `OTP_ADDR` | R/W | Word address [7:0] (0–255) |
+| `0x0C` | `OTP_WDATA` | WO | Write data (program only) |
+| `0x10` | `OTP_RDATA` | RO | Read data (non-key words only; key region returns 0) |
+| `0x14` | `OTP_LOCK` | R/W | `[0]` lock key region from readback (write once) |
+| `0x18` | `OTP_IRQ_EN` | R/W | Interrupt enable |
+
+---
+
+### F. Cadence Genus SDC Additions
+
+Add these to the master SDC for the crypto subsystem:
+
+```tcl
+# ── ECC-521: 521-bit Montgomery multiplier, 8-cycle operation ────────────────
+set_multicycle_path 8 -setup -through [get_pins -hier -filter "name=~*ecc521*mont*"]
+set_multicycle_path 7 -hold  -through [get_pins -hier -filter "name=~*ecc521*mont*"]
+
+# ── PQC NTT butterfly — 4-cycle ──────────────────────────────────────────────
+set_multicycle_path 4 -setup -through [get_pins -hier -filter "name=~*ntt*butterfly*"]
+set_multicycle_path 3 -hold  -through [get_pins -hier -filter "name=~*ntt*butterfly*"]
+
+# ── AES round function — 2-cycle (14 rounds, 2 stages) ───────────────────────
+set_multicycle_path 2 -setup -through [get_pins -hier -filter "name=~*aes*round*"]
+set_multicycle_path 1 -hold  -through [get_pins -hier -filter "name=~*aes*round*"]
+
+# ── TRNG ring oscillator — false path (free-running, not timed by soc_clk) ───
+set_false_path -from [get_pins -hier -filter "name=~*trng*ro_out*"]
+
+# ── OTP read access time — wait states held by FSM (APB PREADY) ──────────────
+# Sense-amp settling: 2–10 soc_clk cycles; modelled as multicycle in controller
+set_multicycle_path 4 -setup -through [get_pins -hier -filter "name=~*otp_ctrl*sense*"]
+
+# ── Crypto clock gating enables (quasi-static) ───────────────────────────────
+set_multicycle_path 2 -setup -to [get_pins -hier -filter "name=~*i_cg_*en_i*"]
+
+# ── OTP VPP domain — analog net, no timing ───────────────────────────────────
+set_false_path -through [get_nets -hier -filter "name=~*otp_vpp*"]
+set_false_path -through [get_nets -hier -filter "name=~*otp_vref*"]
+```
+
+---
+
+### G. uDMA Channel Additions (in `pulp_soc` fork)
+
+Three new uDMA channels are added for AES, SHA, and PQC bulk data movement:
+
+```systemverilog
+// pulp_soc fork: rtl/udma/udma_cfg_pkg.sv — add:
+localparam int unsigned N_AES   = 1;
+localparam int unsigned N_SHA   = 1;
+localparam int unsigned N_PQC   = 1;
+```
+
+Each channel follows the standard uDMA pattern:
+`CPU sets src_addr + length → uDMA bursts data from L2 → IP TX FIFO → IP processes →
+ result in RX FIFO → uDMA bursts to L2 → interrupt to event unit`
+
+---
+
+### H. Bender.yml Changes
+
+```yaml
+# Bender.yml (root repo)
+
+# Fork pulp_soc to add: crypto APB port, OTP APB decode, +3 uDMA channels
+pulp_soc: { git: "https://github.com/<your-org>/pulp_soc.git", branch: "feat/crypto-subsystem" }
+
+# Add crypto subsystem sources
+sources:
+  - hw/crypto_subsystem/crypto_subsystem.sv
+  - hw/crypto_subsystem/aes256/aes256_top.sv
+  - hw/crypto_subsystem/sha256/sha256_top.sv
+  - hw/crypto_subsystem/ecc521/ecc521_top.sv
+  - hw/crypto_subsystem/pqc/pqc_top.sv
+  - hw/crypto_subsystem/trng/trng_top.sv
+  - hw/crypto_subsystem/otp/otp_ctrl.sv
+  - hw/crypto_subsystem/otp/otp_8kb_macro.sv   # black box stub
+```
+
+---
+
+### I. Top-Level SoC Block Diagram — With Crypto + OTP
+
+```
+╔══════════════════════════════════════════════════════════════════════════════════╗
+║  pulpissimo.sv (L0) — pads, clock_gen(PLL×2), rstgen×3, Padrick padframe        ║
+║  NEW: pad_otp_vpp (HV analog), pad_otp_vref (analog) — bypass padframe          ║
+╠══════════════════════════════════════════════════════════════════════════════════╣
+║  soc_domain.sv (L1)                                                              ║
+║  ┌────────────────────────────────────────────────────────────────────────────┐  ║
+║  │  pulp_soc (L2, forked)                                                      │  ║
+║  │                                                                             │  ║
+║  │  MASTERS         ╔══════════════════════════════════════╗   L2 MEMORY      │  ║
+║  │  FC instr ──────►║ ① INTERLEAVED CROSSBAR               ║──► Bank0 112KB   │  ║
+║  │  FC data  ──────►║   = TCDM INTERCONNECT                ║──► Bank1 112KB   │  ║
+║  │  uDMA TX  ──────►║   (lint, single-cycle)               ║──► Bank2 112KB   │  ║
+║  │  uDMA RX  ──────►║   0x1C01_0000 – 0x1C09_0000          ║──► Bank3 112KB   │  ║
+║  │  Debug    ──────►║                                      ║                  │  ║
+║  │  HWPE     ──────►╠══════════════════════════════════════╣   ┌────────────┐ │  ║
+║  │  CRYPTO⑦  ──────►║ ② CONTIGUOUS CROSSBAR                ║──►│PrivBank0/1 │ │  ║
+║  │  (direct)        ║   0x1C00_0000 (private + boot ROM)   ║──►│Boot ROM    │ │  ║
+║  │                  ╠══════════════════════════════════════╣   └────────────┘ │  ║
+║  │                  ║ ③ AXI plug (cluster, tied off)        ║                  │  ║
+║  │                  ╚══════════════════╦═══════════════════╝                  │  ║
+║  │                                     ║ APB bridge                           │  ║
+║  │                  ┌──────────────────▼──────────────────────────────────┐   │  ║
+║  │                  │  PERIPHERAL APB BUS  NB_MASTER=12                   │   │  ║
+║  │                  │  GPIO  uDMA(+AES/SHA/PQC ch)  Timer  EventUnit      │   │  ║
+║  │                  │  SoCCtrl  AdvTimer  HWPE  Debug  STDOUT             │   │  ║
+║  │                  │  CHIP_CTRL 0x1A12_0000 (FLL + pad cfg)              │   │  ║
+║  │                  │  CRYPTO    0x1A14_0000 ──────────────────────────── │──►│  ║
+║  │                  └─────────────────────────────────────────────────────┘   │  ║
+║  └────────────────────────────────────────────────────────────────────────────┘  ║
+║                                                                                  ║
+║  ┌────────────────────────────────────────────────────────────────────────────┐  ║
+║  │  i_crypto_subsystem  (hw/crypto_subsystem/)  APB @ 0x1A14_0000            │  ║
+║  │                                                                             │  ║
+║  │  6-way APB demux on addr[14:12]                                            │  ║
+║  │                                                                             │  ║
+║  │  ┌─────────────┐  ┌─────────────┐  ┌──────────────┐                       │  ║
+║  │  │  AES-256    │  │  SHA-256    │  │  ECC-521     │                       │  ║
+║  │  │  enc + dec  │  │  streaming  │  │  P-521 pt    │                       │  ║
+║  │  │  0x1A14_0000│  │  0x1A14_1000│  │  multiply    │                       │  ║
+║  │  │  ◄═uDMA═►   │  │  ◄═uDMA═►  │  │  0x1A14_2000 │                       │  ║
+║  │  │  irq[0]     │  │  irq[1]     │  │  reg-driven  │                       │  ║
+║  │  └──────┬──────┘  └─────────────┘  │  irq[2]      │                       │  ║
+║  │         │ root_key (private)       │  MCP=8 in SDC│                       │  ║
+║  │         │                          └──────┬───────┘                       │  ║
+║  │  ┌──────▼──────┐  ┌─────────────┐         │ device_key (private)          │  ║
+║  │  │  PQC        │  │  TRNG       │         │                               │  ║
+║  │  │  Kyber-1024 │  │  RO+DRBG   │  ┌──────▼───────┐                      │  ║
+║  │  │  0x1A14_3000│  │  0x1A14_4000│  │  OTP_CTRL    │                      │  ║
+║  │  │  ◄═uDMA═►   │  │  reg-driven │  │  0x1A14_5000 │                      │  ║
+║  │  │  NTT SRAM   │  │  DFT bypass │  │  APB ctrl/   │                      │  ║
+║  │  │  2KB macro  │  │  irq[4]     │  │  status only │                      │  ║
+║  │  │  irq[3]     │  └─────────────┘  │  irq[5]      │                      │  ║
+║  │  └─────────────┘                   └──────┬───────┘                      │  ║
+║  │                                           │ digital pins                  │  ║
+║  │                              ┌────────────▼──────────────┐                │  ║
+║  │                              │  otp_8kb_macro  (ANALOG)  │                │  ║
+║  │                              │  256 × 32-bit  black box  │                │  ║
+║  │                              └───────────┬───────────────┘                │  ║
+║  └──────────────────────────────────────────│────────────────────────────────┘  ║
+║    VPP (HV) ◄────────────────────────────── │ ─────────────► VREF (analog)      ║
+║    bypasses padframe                         │                                   ║
+║    pad_otp_vpp / pad_otp_vref ───────────────┘                                  ║
+╚══════════════════════════════════════════════════════════════════════════════════╝
+```
+
+---
+
+### J. File Change Summary
+
+| File | Change |
+|---|---|
+| `hw/includes/soc_mem_map.svh` | Add `CRYPTO_START/END_ADDR` @ `0x1A14_0000` |
+| `hw/includes/periph_bus_defines.sv` | `NB_MASTER=12`; add `CRYPTO_*` defines |
+| `hw/pulpissimo.sv` | Add `pad_otp_vpp`, `pad_otp_vref` analog pad ports |
+| `hw/soc_domain.sv` | Instantiate `i_crypto_subsystem`; wire APB, uDMA FIFOs, irq[5:0] |
+| `hw/crypto_subsystem/crypto_subsystem.sv` | Subsystem wrapper (new file) |
+| `hw/crypto_subsystem/aes256/aes256_top.sv` | AES-256 IP |
+| `hw/crypto_subsystem/sha256/sha256_top.sv` | SHA-256 IP |
+| `hw/crypto_subsystem/ecc521/ecc521_top.sv` | ECC P-521 IP |
+| `hw/crypto_subsystem/pqc/pqc_top.sv` | PQC Kyber-1024 IP + NTT SRAM macro |
+| `hw/crypto_subsystem/trng/trng_top.sv` | TRNG IP |
+| `hw/crypto_subsystem/otp/otp_ctrl.sv` | OTP digital controller |
+| `hw/crypto_subsystem/otp/otp_8kb_macro.sv` | Black-box stub (sim uses .v model) |
+| `Bender.yml` | Fork `pulp_soc`; add all crypto sources |
+| `pulp_soc` fork | `udma_cfg_pkg.sv` +3 channels; `soc_peripherals.sv` +crypto APB port |
+| Master SDC | Multicycle + false paths for ECC/PQC/AES/TRNG/OTP |
+
+---
+
+### K. Crypto Subsystem ASIC Sign-off Checklist
+
+```
+DIGITAL CRYPTO IPs
+ NB_MASTER=12 in periph_bus_defines.sv                          ☐
+ CRYPTO address window 0x1A14_0000 decoded in soc_interconnect  ☐
+ AES/SHA/PQC uDMA channels added in udma_cfg_pkg.sv             ☐
+ Per-IP ICG using tc_clk_gating (6 instances)                   ☐
+ AES key registers clear on rst_ni assertion                     ☐
+ ECC-521 MCP=8 in master SDC                                     ☐
+ PQC NTT buffer: 2KB SRAM macro (not registers)                 ☐
+ Kyber-1024 confirmed (k=4, n=256, q=3329)                      ☐
+ TRNG: foundry RO cell (not Verilog always loop)                 ☐
+ TRNG: NIST SP 800-90B health tests in RTL                       ☐
+ TRNG: test_en_i forces constant output during scan              ☐
+ Interrupts crypto_irq_o[5:0] mapped to event unit              ☐
+
+OTP ANALOG INTEGRATION
+ 4 views from analog team: .v .lib .lef .gds                    ☐
+ otp_8kb_macro declared black box in Genus                       ☐
+ pad_otp_vpp + pad_otp_vref: dedicated HV pads, bypass padframe  ☐
+ VPP declared as separate power domain in UPF/CPF               ☐
+ VPP pad: HV-rated ESD protection                               ☐
+ OTP macro: placement blockage + routing halo in Innovus        ☐
+ Analog nets (VPP, VREF): set_false_path in SDC                 ☐
+ OTP excluded from scan chain; otp_ctrl logic included          ☐
+ NO MBIST on OTP (writes are permanent)                          ☐
+ Margin-read test mode for weak-bit ATE screening               ☐
+
+SECURITY
+ Root key and device key on private bus — never on APB          ☐
+ Read-lock fuse disables key-region APB readback after provision ☐
+ debug_mode_i zeroes all key outputs when JTAG is active        ☐
+ OTP key words return 0 on APB read regardless of lock state     ☐
+```
+
+---
+
+## Updated Full SoC Area Budget (28nm reference estimates)
+
+| Block | Logic gates (NAND2-eq) | Hard macros | Notes |
+|---|---|---|---|
+| CV32E40P + fpnew FPU | ~100K | — | Largest logic block |
+| SoC Interconnect (TCDM + contiguous) | ~30K | — | Interleaved log xbar dominates |
+| uDMA subsystem (+3 crypto channels) | ~48K | — | HyperBus largest; +3K for new channels |
+| L2 Memory | ~20K | 20 SRAM macros | SRAMs ~80% of chip die area |
+| Peripheral subsystem | ~30K | — | GPIO 12K |
+| Debug/JTAG | ~12K | — | |
+| Clock gen (excl. PLL macro) | ~5K | 2 PLL macros | |
+| Padframe | — | 64 IO cells + 2 analog pads | |
+| rstgen ×3 + glue | ~2K | — | |
+| **AES-256** | **~18K** | — | Balanced-logic cells for SCA |
+| **SHA-256** | **~12K** | — | |
+| **ECC-521** | **~85K** | — | 521-bit multiplier dominates; ~0.3 mm² @ 28nm |
+| **PQC Kyber-1024** | **~35K** | 1 SRAM macro (2KB) | NTT datapath |
+| **TRNG** | **~8K** | 1 RO cell (foundry) | Digital post-processing |
+| **OTP controller** | **~5K** | 1 OTP macro (8 kbit) | Analog macro not in gate count |
+| **Total logic** | **~410K** | 23 SRAM + 2 PLL + 1 OTP + 66 IO | Excl. all hard macros |
+
+---
+
+*Document version 0.5 — Last updated: 2026-06-02*
 *To update: edit `doc/pulpissimo_asic_flow.md` and commit to the branch.*
