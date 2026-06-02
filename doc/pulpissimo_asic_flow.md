@@ -2924,5 +2924,492 @@ SECURITY
 
 ---
 
-*Document version 0.5 — Last updated: 2026-06-02*
+---
+
+## Crypto Subsystem — TCDM Direct Master Port + Full Register Maps {#crypto-detail}
+
+---
+
+### Step 1 — Direct TCDM Master Port for AES and PQC
+
+#### Why direct TCDM over uDMA for AES/PQC
+
+The uDMA shares its two TCDM ports (TX and RX) across **all** channels. When AES is
+running a large CBC operation and PQC is loading a 1.5 KB key simultaneously, they
+queue behind UART, I2C, HyperBus, and each other. The direct TCDM master gives AES
+and PQC **dedicated, non-arbitrated single-cycle access** to the interleaved L2 banks
+— exactly how HWPE connects.
+
+| Property | uDMA channel | Direct TCDM master ⑦ |
+|---|---|---|
+| Grant latency | 1 cycle (if no conflict) + FIFO overhead | 1 cycle guaranteed (dedicated port) |
+| Throughput | Shared across all uDMA channels | Dedicated: 32 bits × 200 MHz = 6.4 GB/s |
+| Effort | Low — `udma_cfg_pkg` +N | High — fork `soc_interconnect`, add port |
+| Best for | SHA (compute-bound), UART, I2C | AES-CBC bulk, PQC key streaming |
+
+SHA stays on uDMA (it processes one 64-byte block at a time; the bus is never the
+bottleneck). AES and PQC get direct TCDM master ports.
+
+---
+
+#### Lint Protocol — Signal Reference
+
+From `i_soc_domain.i_pulp_soc.i_soc_interconnect_wrap.tcdm_debug` (verified in
+`target/sim/tb/tb_pulp.sv:850`):
+
+```
+Signal     Dir (master→slave)   Width   Description
+─────────────────────────────────────────────────────────────────────
+req        →                    1       Request — hold until gnt
+gnt        ←                    1       Grant — request accepted this cycle
+add        →                    32      Byte address
+wen        →                    1       1 = read, 0 = write
+wdata      →                    32      Write data
+be         →                    4       Byte enable (1 bit per byte)
+─────────────────────────────────────────────────────────────────────
+r_rdata    ←                    32      Read data — valid one cycle after gnt+read
+r_valid    ←                    1       Read data valid strobe
+─────────────────────────────────────────────────────────────────────
+```
+
+Transaction rules:
+- `req` goes high and stays high until `gnt` is seen
+- Address and write data must be stable while `req` is high and `gnt` is low
+- Read data arrives **exactly one cycle** after the cycle where `gnt=1` and `wen=1`
+- `r_valid` confirms the read data cycle (needed when multiple requests are pipelined)
+- Writes have **no response** — if `gnt=1` and `wen=0`, data is written immediately
+
+---
+
+#### SystemVerilog Interface Declaration
+
+Create `hw/crypto_subsystem/tcdm_master_if.sv`:
+
+```systemverilog
+// hw/crypto_subsystem/tcdm_master_if.sv
+interface tcdm_master_if #(
+  parameter int unsigned ADDR_WIDTH = 32,
+  parameter int unsigned DATA_WIDTH = 32
+)(
+  input logic clk_i
+);
+  logic                       req;
+  logic                       gnt;
+  logic [ADDR_WIDTH-1:0]      add;
+  logic                       wen;    // 1=read, 0=write
+  logic [DATA_WIDTH-1:0]      wdata;
+  logic [DATA_WIDTH/8-1:0]    be;
+  logic [DATA_WIDTH-1:0]      r_rdata;
+  logic                       r_valid;
+
+  modport Master (
+    output req, add, wen, wdata, be,
+    input  gnt, r_rdata, r_valid
+  );
+  modport Slave (
+    input  req, add, wen, wdata, be,
+    output gnt, r_rdata, r_valid
+  );
+endinterface
+```
+
+---
+
+#### AES-256 TCDM DMA Engine — Internal Block
+
+Each of AES and PQC contains a small **TCDM DMA engine** inside the IP — it is
+not a separate block. The CPU writes the base address and length via APB; the
+engine drives the TCDM master port autonomously:
+
+```systemverilog
+// Inside aes256_top.sv — TCDM DMA engine registers (APB-writable)
+logic [31:0] r_src_addr;    // base address of plaintext in L2
+logic [31:0] r_dst_addr;    // base address for ciphertext in L2
+logic [15:0] r_length;      // number of 16-byte blocks
+logic        r_start;       // write 1 to begin
+
+// FSM states
+typedef enum logic [1:0] {
+  IDLE,
+  FETCH,   // read 4 words (128-bit block) from L2 via TCDM
+  PROCESS, // AES round pipeline (20 cycles for AES-256)
+  STORE    // write 4 words (128-bit result) to L2 via TCDM
+} aes_dma_state_t;
+```
+
+TCDM burst pattern (one 128-bit AES block):
+
+```
+Cycle  req  wen  add              gnt   Comment
+  0     1    1   src_addr+0       1     read word 0 of plaintext block
+  1     1    1   src_addr+4       1     read word 1
+  2     1    1   src_addr+8       1     read word 2
+  3     1    1   src_addr+12      1     read word 3
+  3                                     r_rdata[word0] valid (1-cycle latency)
+  4                                     r_rdata[word1], [word2], [word3] follow
+ 24     1    0   dst_addr+0       1     write ciphertext word 0
+ 25     1    0   dst_addr+4       1     write ciphertext word 1
+ 26     1    0   dst_addr+8       1     write ciphertext word 2
+ 27     1    0   dst_addr+12      1     write ciphertext word 3
+```
+
+Throughput: 1 block / 28 cycles = **7.1 Mblocks/s = 114 MB/s** at 200 MHz.
+
+---
+
+#### Connecting the TCDM Master Port in `pulp_soc` Fork
+
+In your `pulp_soc` fork, `soc_interconnect_wrap.sv` instantiates the interleaved
+crossbar. Add the crypto TCDM master ports alongside the HWPE port:
+
+```systemverilog
+// pulp_soc fork: rtl/soc_interconnect/soc_interconnect_wrap.sv
+
+// Add two new TCDM master ports (AES, PQC)
+XBAR_TCDM_BUS aes_tcdm_master();
+XBAR_TCDM_BUS pqc_tcdm_master();
+
+// Pass out through soc_peripherals → pulp_soc → soc_domain hierarchy
+// so crypto_subsystem.sv can connect to them
+
+// Inside the interleaved crossbar instantiation — add to masters array:
+// was: masters = {fc_instr, fc_data, udma_tx, udma_rx, debug, hwpe}
+// now: masters = {fc_instr, fc_data, udma_tx, udma_rx, debug, hwpe,
+//                 aes_tcdm, pqc_tcdm}
+```
+
+Add `USE_CRYPTO_TCDM` parameter to `pulpissimo.sv` and `soc_domain.sv` (same
+pattern as `USE_HWPE`) to allow synthesis without the extra master ports if
+uDMA-only mode is desired.
+
+---
+
+#### Updated `crypto_subsystem.sv` Port List (with TCDM)
+
+```systemverilog
+module crypto_subsystem #(
+  parameter int unsigned APB_ADDR_WIDTH = 32,
+  parameter bit          USE_TCDM_MASTER = 1  // 0 = fall back to uDMA
+)(
+  input  logic       clk_i,
+  input  logic       rst_ni,
+  input  logic       test_en_i,
+  input  logic       debug_mode_i,
+  APB.Slave          apb_slave,
+
+  // ── TCDM master ports (AES and PQC only) ─────────────────────────────────
+  tcdm_master_if.Master  aes_tcdm,   // direct to interleaved crossbar
+  tcdm_master_if.Master  pqc_tcdm,
+
+  // ── uDMA FIFO (SHA only — AES/PQC bypass if USE_TCDM_MASTER=1) ──────────
+  output logic [31:0] sha_tx_data_o,  output logic sha_tx_valid_o,
+  input  logic        sha_tx_ready_i,
+  input  logic [31:0] sha_rx_data_i,  input  logic sha_rx_valid_i,
+  output logic        sha_rx_ready_o,
+
+  // ── Interrupts ────────────────────────────────────────────────────────────
+  output logic [5:0]  crypto_irq_o,  // [0]=AES [1]=SHA [2]=ECC [3]=PQC [4]=TRNG [5]=OTP
+
+  // ── OTP analog pins (routed to dedicated top-level pads) ─────────────────
+  inout  wire         otp_vpp,
+  inout  wire         otp_vref
+);
+```
+
+---
+
+### Step 2 — Full Register Maps for All 6 IPs
+
+All registers are 32-bit, APB-accessible, reset to 0 unless noted.
+Base addresses are within the `0x1A14_xxxx` window.
+
+---
+
+#### 2.1 AES-256 Register Map (`0x1A14_0000`)
+
+| Offset | Name | Access | Reset | Description |
+|---|---|---|---|---|
+| `0x00` | `AES_CTRL` | R/W | `0x0` | `[0]` START · `[1]` MODE (0=enc,1=dec) · `[2]` OPMODE (0=ECB,1=CBC,2=GCM) · `[4]` CLR_IRQ · `[5]` CLK_EN |
+| `0x04` | `AES_STATUS` | RO | `0x0` | `[0]` BUSY · `[1]` DONE · `[2]` GCM_AUTH_OK · `[3]` ERROR |
+| `0x08` | `AES_SRC_ADDR` | R/W | — | Source base address in L2 (plaintext/ciphertext) |
+| `0x0C` | `AES_DST_ADDR` | R/W | — | Destination base address in L2 |
+| `0x10` | `AES_LEN` | R/W | — | `[15:0]` Number of 16-byte blocks |
+| `0x14` | `AES_IV_0` | WO | — | IV word 0 `[31:0]` (CBC/GCM) |
+| `0x18` | `AES_IV_1` | WO | — | IV word 1 `[63:32]` |
+| `0x1C` | `AES_IV_2` | WO | — | IV word 2 `[95:64]` |
+| `0x20` | `AES_IV_3` | WO | — | IV word 3 `[127:96]` |
+| `0x24`–`0x40` | `AES_KEY_0`–`7` | WO | — | 256-bit key (8 × 32-bit writes, WO — no readback) |
+| `0x44` | `AES_AAD_ADDR` | R/W | — | GCM: AAD base address in L2 |
+| `0x48` | `AES_AAD_LEN` | R/W | — | GCM: AAD length in bytes |
+| `0x4C`–`0x58` | `AES_TAG_0`–`3` | RO | — | GCM: authentication tag (128-bit) |
+| `0x5C` | `AES_IRQ_EN` | R/W | `0x0` | `[0]` enable DONE interrupt |
+
+**Key-load from OTP (hardware path):**
+When `OTP_CTRL.KEY_LOAD` is pulsed, `otp_root_key[255:0]` is latched directly
+into the AES key register array without going through APB. The `AES_KEY_*`
+registers return `0x00000000` on any read regardless of how the key was loaded.
+
+---
+
+#### 2.2 SHA-256 Register Map (`0x1A14_1000`)
+
+| Offset | Name | Access | Reset | Description |
+|---|---|---|---|---|
+| `0x00` | `SHA_CTRL` | R/W | `0x0` | `[0]` START · `[1]` INIT (1=new hash, 0=continue) · `[2]` LAST_BLOCK · `[4]` CLR_IRQ · `[5]` CLK_EN |
+| `0x04` | `SHA_STATUS` | RO | `0x0` | `[0]` BUSY · `[1]` DONE · `[2]` ERROR |
+| `0x08` | `SHA_SRC_ADDR` | R/W | — | Source base address in L2 (message data) |
+| `0x0C` | `SHA_LEN` | R/W | — | `[31:0]` Message length in bytes (max 512 MB) |
+| `0x10`–`0x2C` | `SHA_DIGEST_0`–`7` | RO | — | 256-bit digest (8 × 32-bit, valid when DONE=1) |
+| `0x30` | `SHA_PAD_EN` | R/W | `0x1` | `[0]` auto-append PKCS padding (disable for HMAC inner/outer) |
+| `0x34` | `SHA_IRQ_EN` | R/W | `0x0` | `[0]` enable DONE interrupt |
+
+**uDMA data flow (SHA uses uDMA, not direct TCDM):**
+CPU writes `SHA_SRC_ADDR` + `SHA_LEN` + `SHA_CTRL.START`. SHA controller signals
+uDMA via the TX FIFO interface; uDMA fetches 64-byte blocks from L2 and pushes
+them into the SHA message scheduler. DONE interrupt fires when all blocks hashed.
+
+---
+
+#### 2.3 ECC-521 Register Map (`0x1A14_2000`)
+
+| Offset | Name | Access | Reset | Description |
+|---|---|---|---|---|
+| `0x00` | `ECC_CTRL` | R/W | `0x0` | `[0]` START · `[1:0]` OP (00=PMUL, 01=PADD, 10=VERIFY) · `[4]` CLR_IRQ · `[5]` CLK_EN |
+| `0x04` | `ECC_STATUS` | RO | `0x0` | `[0]` BUSY · `[1]` DONE · `[2]` VERIFY_OK · `[3]` POINT_AT_INF · `[4]` ERROR |
+| `0x08`–`0x58` | `ECC_PX_0`–`16` | R/W | — | Input point Px (521-bit = 17 × 32-bit, top word uses [8:0] only) |
+| `0x5C`–`0xAC` | `ECC_PY_0`–`16` | R/W | — | Input point Py (521-bit) |
+| `0xB0`–`0x100` | `ECC_K_0`–`16` | WO | — | Scalar k (521-bit, WO — private key from OTP never via APB) |
+| `0x104`–`0x154` | `ECC_RX_0`–`16` | RO | — | Result point Rx (valid when DONE=1) |
+| `0x158`–`0x1A8` | `ECC_RY_0`–`16` | RO | — | Result point Ry |
+| `0x1AC` | `ECC_CURVE` | R/W | `0x0` | `[0]` 0=P-521 (only curve supported in this IP) |
+| `0x1B0` | `ECC_IRQ_EN` | R/W | `0x0` | `[0]` enable DONE interrupt |
+
+**OTP private key path:**
+When `OTP_CTRL.KEY_LOAD` is pulsed, `otp_device_key[255:0]` is sign-extended and
+loaded into `ECC_K_*` registers directly. The scalar registers always read as zero.
+
+**Timing note:** P-521 point multiply runs ~1.5 M cycles (~7.5 ms @ 200 MHz). The
+CPU issues START and enters WFI. ECC fires `crypto_irq_o[2]` on completion.
+
+---
+
+#### 2.4 PQC Kyber-1024 Register Map (`0x1A14_3000`)
+
+| Offset | Name | Access | Reset | Description |
+|---|---|---|---|---|
+| `0x00` | `PQC_CTRL` | R/W | `0x0` | `[1:0]` OP (00=KEYGEN, 01=ENCAPS, 10=DECAPS) · `[2]` START · `[4]` CLR_IRQ · `[5]` CLK_EN |
+| `0x04` | `PQC_STATUS` | RO | `0x0` | `[0]` BUSY · `[1]` DONE · `[2]` DECAPS_FAIL · `[3]` ERROR |
+| `0x08` | `PQC_PK_ADDR` | R/W | — | L2 address of public key (1568 bytes) |
+| `0x0C` | `PQC_SK_ADDR` | R/W | — | L2 address of secret key (3168 bytes) |
+| `0x10` | `PQC_CT_ADDR` | R/W | — | L2 address of ciphertext (1568 bytes) |
+| `0x14` | `PQC_SS_ADDR` | R/W | — | L2 address for shared secret output (32 bytes) |
+| `0x18` | `PQC_SEED_ADDR` | R/W | — | L2 address of 64-byte seed (KEYGEN) from TRNG |
+| `0x1C` | `PQC_NTT_CTRL` | R/W | `0x0` | `[0]` NTT bypass (test only) · `[1]` NTT_DONE (RO status) |
+| `0x20` | `PQC_CYCLES_HI` | RO | — | Cycle counter [63:32] (performance profiling) |
+| `0x24` | `PQC_CYCLES_LO` | RO | — | Cycle counter [31:0] |
+| `0x28` | `PQC_IRQ_EN` | R/W | `0x0` | `[0]` enable DONE interrupt |
+
+**KEYGEN flow:**
+1. TRNG generates 64-byte seed → written to L2 at `PQC_SEED_ADDR`
+2. CPU writes `PQC_CTRL.OP=KEYGEN`, `START=1`
+3. PQC reads seed via TCDM, runs NTT, writes pk+sk to L2 via TCDM
+4. `PQC_STATUS.DONE=1`, `crypto_irq_o[3]` fires
+
+**ENCAPS flow:** reads pk from L2, generates ciphertext + shared secret, writes both to L2
+
+**DECAPS flow:** reads sk+ct from L2; if MAC check fails, `DECAPS_FAIL=1`
+(implicit rejection — shared secret is set to H(sk, ct), not leaked)
+
+---
+
+#### 2.5 TRNG Register Map (`0x1A14_4000`)
+
+| Offset | Name | Access | Reset | Description |
+|---|---|---|---|---|
+| `0x00` | `TRNG_CTRL` | R/W | `0x0` | `[0]` ENABLE RO · `[1]` DRBG_EN (enable AES-CTR output mode) · `[2]` RESEED · `[4]` CLR_IRQ · `[5]` CLK_EN |
+| `0x04` | `TRNG_STATUS` | RO | `0x0` | `[0]` VALID (entropy word ready) · `[1]` HEALTH_FAIL · `[2]` SEED_DONE · `[3]` DRBG_READY |
+| `0x08` | `TRNG_DATA` | RO | — | 32-bit entropy word (reading clears VALID and advances FIFO) |
+| `0x0C` | `TRNG_FIFO_LEVEL` | RO | — | `[3:0]` Number of 32-bit words in entropy FIFO (max 16) |
+| `0x10` | `TRNG_HEALTH_CTRL`| R/W | `0x3` | `[0]` rep-count test en · `[1]` adaptive-prop test en (NIST SP 800-90B) |
+| `0x14` | `TRNG_HEALTH_STAT`| RO | — | `[15:0]` adaptive proportion window counter · `[31:16]` fail count |
+| `0x18` | `TRNG_TEST_CTRL` | R/W | `0x0` | `[0]` DFT bypass — forces TRNG output to `0xDEADBEEF` in scan |
+| `0x1C` | `TRNG_IRQ_EN` | R/W | `0x0` | `[0]` FIFO-half-full · `[1]` health fail |
+
+**Typical firmware usage:**
+```c
+// Seed PQC keygen with 64 bytes of TRNG entropy
+TRNG_CTRL = 0x1;                   // enable RO
+while (!(TRNG_STATUS & 0x1));      // wait for first word
+for (int i = 0; i < 16; i++) {
+    seed[i] = TRNG_DATA;           // 16 × 32-bit = 64 bytes
+    while (!(TRNG_STATUS & 0x1));  // wait for next word
+}
+```
+
+---
+
+#### 2.6 OTP Controller Register Map (`0x1A14_5000`)
+
+| Offset | Name | Access | Reset | Description |
+|---|---|---|---|---|
+| `0x00` | `OTP_CTRL` | R/W | `0x0` | `[0]` START_READ · `[1]` START_PROG · `[2]` KEY_LOAD (pulse — latches keys to AES/ECC) · `[3]` MARGIN_READ (test mode) |
+| `0x04` | `OTP_STATUS` | RO | `0x0` | `[0]` BUSY · `[1]` DONE · `[2]` PROG_ERR · `[3]` VERIFY_ERR · `[4]` KEY_VALID · `[5]` LOCKED |
+| `0x08` | `OTP_ADDR` | R/W | — | `[7:0]` Word address (0–255, i.e. 256 × 32-bit = 8 kbit) |
+| `0x0C` | `OTP_WDATA` | WO | — | 32-bit word to program (write only) |
+| `0x10` | `OTP_RDATA` | RO | — | 32-bit word read result (key region always returns 0) |
+| `0x14` | `OTP_LOCK` | R/W | `0x0` | `[0]` lock key region (write once; clears permanently if set) · `[1]` lock provisioning region |
+| `0x18` | `OTP_KEY_REGION`| R/W | `0x0` | `[7:0]` start word of key region · `[15:8]` end word (default: 0–15 = 512 bits) |
+| `0x1C` | `OTP_VPP_CTRL` | R/W | `0x0` | `[0]` VPP_EN — enables high-voltage path (must be 0 except during programming) |
+| `0x20` | `OTP_ECC_CTRL` | R/W | `0x3` | `[0]` ECC en · `[1]` redundancy en · `[7:4]` ECC syndrome (RO after read) |
+| `0x24` | `OTP_IRQ_EN` | R/W | `0x0` | `[0]` DONE · `[1]` error |
+
+**OTP memory map (256 words × 32-bit = 8 kbit):**
+
+```
+Word 0  – 15   (512 bits)   AES root key (256-bit) + ECC device key (256-bit)
+Word 16 – 23   (256 bits)   Device ID / serial number
+Word 24 – 31   (256 bits)   Boot configuration flags
+Word 32 – 255  (7168 bits)  User-defined provisioning data
+```
+
+**Key load sequence (run once at boot by Boot ROM):**
+```
+1. OTP_CTRL.START_READ + OTP_ADDR=0  → read and verify key region
+2. OTP_STATUS.DONE=1, VERIFY_ERR=0   → keys intact
+3. OTP_CTRL.KEY_LOAD=1               → pulse latches otp_root_key→AES,
+                                         otp_device_key→ECC
+4. OTP_STATUS.KEY_VALID=1            → crypto IPs ready
+5. OTP_LOCK[0]=1                     → prevent future APB key-region reads
+```
+
+---
+
+### Step 1+2 Combined Architecture Diagram
+
+```
+╔═══════════════════════════════════════════════════════════════════════════════════════╗
+║  pulpissimo.sv (L0)                                                                    ║
+║  pad_otp_vpp ──────────────────────────────────────────────────────────────────────► ║
+║  pad_otp_vref ─────────────────────────────────────────────────────────────────────► ║
+╠═══════════════════════════════════════════════════════════════════════════════════════╣
+║  pulp_soc (L2, forked) — soc_interconnect_wrap                                        ║
+║                                                                                        ║
+║  ┌─────────────────────────────────────────────────────────────────────────────────┐  ║
+║  │              INTERLEAVED TCDM CROSSBAR  (lint protocol, single-cycle)            │  ║
+║  │                                                                                   │  ║
+║  │  ┌──────────┐ instr  ┌──────────┐ TX  ┌──────────┐     ┌──────────────────────┐│  ║
+║  │  │FC core   ├───────►│          │────►│          │     │  L2 BANK 0  112KB    ││  ║
+║  │  │CV32E40P  │ data   │          │ RX  │          │     │  (SRAM macro)         ││  ║
+║  │  │          ├───────►│          │────►│          │◄───►│  addr[3:2]=00        ││  ║
+║  │  └──────────┘        │  TCDM    │     │  uDMA    │     ├──────────────────────┤│  ║
+║  │  ┌──────────┐        │  LOG     │     │  (SHA    │     │  L2 BANK 1  112KB    ││  ║
+║  │  │Debug     ├───────►│  INTER-  │     │   only)  │     │  addr[3:2]=01        ││  ║
+║  │  └──────────┘        │  LEAVED  │     └──────────┘     ├──────────────────────┤│  ║
+║  │  ┌──────────┐        │  XBAR    │                       │  L2 BANK 2  112KB    ││  ║
+║  │  │HWPE      ├───────►│          │                       │  addr[3:2]=10        ││  ║
+║  │  └──────────┘        │  8 master│                       ├──────────────────────┤│  ║
+║  │                       │  ports   │                       │  L2 BANK 3  112KB    ││  ║
+║  │  ┌──────────────────┐ │          │                       │  addr[3:2]=11        ││  ║
+║  │  │AES TCDM ENGINE ⑦├►│          │◄─────────────────────►│  req/gnt/add/wen    ││  ║
+║  │  │  req/gnt/add/wen │ │          │                       │  wdata/be/r_rdata   ││  ║
+║  │  │  wdata/be/r_rdata│ │          │                       │  r_valid             ││  ║
+║  │  └──────────────────┘ │          │                       └──────────────────────┘│  ║
+║  │  ┌──────────────────┐ │          │                                               │  ║
+║  │  │PQC TCDM ENGINE ⑦├►│          │                                               │  ║
+║  │  └──────────────────┘ └──────────┘                                               │  ║
+║  └─────────────────────────────────────────────────────────────────────────────────┘  ║
+║                │ APB 0x1A14_0000                                                       ║
+╠═══════════════╪═══════════════════════════════════════════════════════════════════════╣
+║  i_crypto_subsystem                                                                    ║
+║               │                                                                        ║
+║  ┌────────────▼───────────────────────────────────────────────────────────────────┐   ║
+║  │  6-WAY APB DEMUX  addr[14:12]                                                  │   ║
+║  └──┬──────────┬──────────┬──────────┬──────────┬──────────┬─────────────────────┘   ║
+║    000        001        010        011        100        101                          ║
+║     │          │          │          │          │          │                           ║
+║  ┌──▼───────┐ ┌▼─────────┐┌─────────▼┐┌────────▼─┐┌──────▼──┐┌──────────▼─────────┐ ║
+║  │ AES-256  │ │ SHA-256  ││ ECC-521  ││PQC       ││ TRNG    ││ OTP_CTRL           │ ║
+║  │0x1A14_   │ │0x1A14_   ││0x1A14_   ││Kyber-    ││0x1A14_  ││ 0x1A14_5000       │ ║
+║  │  0000    │ │  1000    ││  2000    ││1024      ││  4000   ││ APB ctrl/status   │ ║
+║  │          │ │          ││          ││0x1A14_   ││         ││ only (no key read) │ ║
+║  │ CTRL     │ │ CTRL     ││ CTRL     ││  3000    ││ CTRL    ││ CTRL  STATUS      │ ║
+║  │ STATUS   │ │ STATUS   ││ STATUS   ││          ││ STATUS  ││ ADDR  WDATA       │ ║
+║  │ SRC_ADDR │ │ SRC_ADDR ││ PX[0:16] ││ CTRL     ││ DATA    ││ RDATA LOCK        │ ║
+║  │ DST_ADDR │ │ LEN      ││ PY[0:16] ││ STATUS   ││ FIFO_   ││ KEY_REGION        │ ║
+║  │ LEN      │ │ DIGEST   ││ K[0:16]  ││ PK_ADDR  ││  LEVEL  ││ VPP_CTRL          │ ║
+║  │ IV[0:3]  │ │ (8×32)   ││ RX[0:16] ││ SK_ADDR  ││ HEALTH  ││ ECC_CTRL          │ ║
+║  │ KEY[0:7] │ │ PAD_EN   ││ RY[0:16] ││ CT_ADDR  ││ TEST_   ││                   │ ║
+║  │ (WO,256b)│ │ IRQ_EN   ││ CURVE    ││ SS_ADDR  ││  CTRL   ││ irq[5]            │ ║
+║  │ AAD(GCM) │ │          ││ IRQ_EN   ││ SEED_ADDR││ IRQ_EN  ││          │        │ ║
+║  │ TAG(GCM) │ │  uDMA    ││          ││ NTT_CTRL ││         ││          │        │ ║
+║  │ IRQ_EN   │ │  FIFO◄══►│└─────────┘│ CYCLES   ││   RO    ││          ▼        │ ║
+║  │          │ │          │           │ IRQ_EN   ││ entropy ││ otp_8kb_macro      │ ║
+║  │ irq[0]   │ │ irq[1]   │  irq[2]  │          ││ +DRBG   ││ 256×32-bit         │ ║
+║  │          │ │          │  MCP=8   │ irq[3]   ││ irq[4]  ││ ANALOG HARD IP     │ ║
+║  │  TCDM◄══►│ └──────────┘  ~1.5M   │  TCDM◄══►││ DFT byp ││ VPP────────────►  │ ║
+║  │  ENGINE  │                cycles  │  ENGINE  │└─────────┘│ VREF───────────►  │ ║
+║  └──────────┘                        └──────────┘           └────────────────────┘ ║
+║       │                                   │                       │ private key bus  ║
+║  ┌────┴───────────────────────────────────┘                       │                  ║
+║  │              root_key[255:0] ◄─────────────────────────────────┘                  ║
+║  │              device_key[255:0] ◄───────────────────────────────┐                  ║
+║  │              (private — never on APB, zeroed when debug_mode=1) │                  ║
+║  └─────────────────────────────────────────► AES-256 key input    │                  ║
+║                                              ECC-521 scalar K ◄───┘                  ║
+╚═══════════════════════════════════════════════════════════════════════════════════════╝
+
+TCDM lint signals (from tb_pulp.sv verified):
+  AES/PQC → crossbar:  req · gnt · add[31:0] · wen · wdata[31:0] · be[3:0]
+  crossbar → AES/PQC:  gnt · r_rdata[31:0] · r_valid
+  Latency: gnt=cycle N → r_rdata valid=cycle N+1 (single-cycle SRAM access)
+
+SHA → uDMA → TCDM:  CPU sets SHA_SRC_ADDR + SHA_LEN, uDMA owns the TCDM port
+ECC, TRNG, OTP:     register-driven only, no TCDM connection
+```
+
+---
+
+### TCDM Throughput Comparison
+
+```
+Path                     Cycles/block    Throughput @ 200 MHz    Use case
+─────────────────────────────────────────────────────────────────────────────
+AES direct TCDM (⑦)        28 / block       114 MB/s             bulk CBC/GCM
+PQC direct TCDM (⑦)         4 / word        800 MB/s (burst)     NTT stream
+SHA via uDMA                 8 / 64B block   ~200 MB/s            hash stream
+ECC — no TCDM              N/A (reg only)    N/A                  register ops
+TRNG — no TCDM             N/A (reg only)    N/A                  entropy words
+OTP — no TCDM              N/A (reg only)    N/A                  key load once
+```
+
+---
+
+### Changes Required in `pulp_soc` Fork (summary)
+
+```
+pulp_soc fork: rtl/soc_interconnect/soc_interconnect_wrap.sv
+  → add XBAR_TCDM_BUS aes_tcdm_master and pqc_tcdm_master
+  → add both to masters array of i_interleaved_crossbar
+  → expose ports up through pulp_soc.sv → soc_domain.sv
+
+pulp_soc fork: rtl/udma/udma_cfg_pkg.sv
+  → N_SHA = 1   (AES and PQC now use TCDM, not uDMA)
+
+pulp_soc fork: rtl/soc_peripherals.sv
+  → add APB decode for 0x1A14_0000 window → apb_crypto_master port
+  → add crypto_irq_i[5:0] → event unit
+
+hw/includes/soc_mem_map.svh        → add CRYPTO_START/END defines
+hw/includes/periph_bus_defines.sv  → NB_MASTER=12, CRYPTO window
+hw/pulpissimo.sv                   → pad_otp_vpp, pad_otp_vref ports
+hw/soc_domain.sv                   → instantiate crypto_subsystem
+hw/crypto_subsystem/               → all 6 IPs + tcdm_master_if.sv
+Bender.yml                         → fork + source file list
+Master SDC                         → ECC MCP=8, PQC MCP=4, AES MCP=2,
+                                      TRNG/OTP false paths
+```
+
+---
+
+*Document version 0.6 — Last updated: 2026-06-02*
 *To update: edit `doc/pulpissimo_asic_flow.md` and commit to the branch.*
