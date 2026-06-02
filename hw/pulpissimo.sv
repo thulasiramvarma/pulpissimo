@@ -82,7 +82,10 @@ module pulpissimo #(
   // general purpose pads, since PULPissimo v8.0 any peripheral including
   // GPIO) can be mapped to any pad any-to-any muxing. Check the latest
   // README.md on description and how to modify the pad count)
-  inout wire [IO_PAD_COUNT-1:0] pad_io
+  inout wire [IO_PAD_COUNT-1:0] pad_io,
+  // OTP analog supply pads (bypasses padframe, connects directly to OTP macro)
+  inout wire                    pad_otp_vpp,
+  inout wire                    pad_otp_vref
 );
 `include "soc_mem_map.svh"
 `include "apb/assign.svh"

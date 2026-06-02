@@ -83,3 +83,7 @@
 // Cluster Address Regions
 `define SOC_MEM_MAP_CLUSTER_START_ADDR                 32'h1000_0000 // This define is currently not used in the code and just here for documentation
 `define SOC_MEM_MAP_CLUSTER_END_ADDR                   32'h2000_0000 // TODO Actually use the define in soc_mem_map.svh for cluster address space definition
+
+// Crypto Subsystem Address Region (AES-256, SHA-256, ECC-521, PQC Kyber-1024, TRNG, OTP_CTRL)
+`define SOC_MEM_MAP_CRYPTO_START_ADDR                  32'h1A14_0000
+`define SOC_MEM_MAP_CRYPTO_END_ADDR                    32'h1A18_0000
