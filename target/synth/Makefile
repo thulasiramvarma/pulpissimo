@@ -37,6 +37,7 @@ synth: bender_sources
 
 ## Run synthesis for all blocks in dependency order
 synth_all:
+	$(MAKE) synth BLOCK=fc
 	$(MAKE) synth BLOCK=aes256
 	$(MAKE) synth BLOCK=sha256
 	$(MAKE) synth BLOCK=ecc521
@@ -53,5 +54,5 @@ clean:
 
 help:
 	@echo "Targets: synth bender_sources synth_all clean"
-	@echo "BLOCK options: aes256 sha256 ecc521 kyber trng otp_ctrl crypto_subsystem pulp_soc pulpissimo"
+	@echo "BLOCK options: fc aes256 sha256 ecc521 kyber trng otp_ctrl crypto_subsystem pulp_soc pulpissimo"
 	@echo "GENUS: path to genus binary (default: genus)"

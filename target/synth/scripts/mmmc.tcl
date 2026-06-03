@@ -35,11 +35,18 @@ create_delay_corner -name best_hold   -timing_condition tc_ff -rc_corner rc_best
 create_delay_corner -name typical     -timing_condition tc_tt -rc_corner rc_typ
 
 # ---- Constraint modes ----
-create_constraint_mode -name func \
-  -sdc_files [list \
-    [file dirname [info script]]/constraints_soc.sdc \
-    [file dirname [info script]]/constraints_crypto.sdc \
-  ]
+# Per-block SDC selection. Each block sources its own constraint file plus the
+# shared SoC constraints. Defaults to soc+crypto when BLOCK is unset.
+set _sdc_dir [file dirname [info script]]
+switch -- $BLOCK {
+  fc       { set _sdc_files [list $_sdc_dir/constraints_fc.sdc] }
+  aes256 - sha256 - ecc521 - kyber - trng - otp_ctrl - crypto_subsystem {
+             set _sdc_files [list $_sdc_dir/constraints_crypto.sdc] }
+  default  { set _sdc_files [list $_sdc_dir/constraints_soc.sdc \
+                                  $_sdc_dir/constraints_crypto.sdc] }
+}
+
+create_constraint_mode -name func -sdc_files $_sdc_files
 
 # ---- Analysis views ----
 create_analysis_view -name setup_view -constraint_mode func -delay_corner worst_setup

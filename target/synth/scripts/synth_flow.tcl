@@ -16,6 +16,7 @@ puts "\[synth\] Reading HDL sources..."
 source $SCRIPT_DIR/bender_sources.tcl
 
 # Block-specific top module
+set TOP_MAP(fc)               fc_subsystem
 set TOP_MAP(aes256)           aes256_top
 set TOP_MAP(sha256)           sha256_top
 set TOP_MAP(ecc521)           ecc521_top
