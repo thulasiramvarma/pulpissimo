@@ -50,7 +50,11 @@ check_genus:
 bender_sources: check_bender
 	mkdir -p $(SCRIPT_DIR)
 	cd ../../ && $(BENDER) script genus $(BENDER_TARGETS) \
-		--source-annotations > $(SCRIPT_DIR)/bender_sources.tcl
+		> $(SCRIPT_DIR)/bender_sources.tcl
+	@# Fix bender 0.28.x genus template bugs: '{{'/'}}' braces and 'set X = "..."'
+	@sed -i -e 's/{{/{/g' -e 's/}}/}/g' \
+		-e 's/^set ROOT = "/set ROOT "/' \
+		$(SCRIPT_DIR)/bender_sources.tcl
 	@echo "[synth] Bender sources written to $(SCRIPT_DIR)/bender_sources.tcl"
 
 ## Run synthesis for BLOCK

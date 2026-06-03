@@ -19,14 +19,19 @@ set_output_delay -clock fc_clk -max 0.5 [all_outputs]
 set_false_path -from [get_ports rst_ni]
 
 # ---- Async control inputs into FC (synchronized internally) ----
-# Boot/fetch enable, interrupt lines, and debug request are async to fc_clk.
-set_false_path -from [get_ports fetch_enable_i] -quiet
-set_false_path -from [get_ports irq_i*]         -quiet
-set_false_path -from [get_ports debug_req_i]    -quiet
+# Port names verified against pulp_soc rtl/fc/fc_subsystem.sv.
+set_false_path -from [get_ports fetch_en_i]         -quiet
+set_false_path -from [get_ports debug_req_i]        -quiet
+set_false_path -from [get_ports interrupts_i*]      -quiet
+set_false_path -from [get_ports event_fifo_valid_i] -quiet
+set_false_path -from [get_ports event_fifo_data_i*] -quiet
 
-# ---- DFT signals: don't time (connected at DFT insertion) ----
-set_false_path -from [get_ports test_en_i]    -quiet
-set_false_path -from [get_ports scan_cg_en_i] -quiet
+# ---- boot_addr_i: static configuration, constant at runtime ----
+set_false_path -from [get_ports boot_addr_i*] -quiet
+
+# ---- DFT signal: don't time (connected at DFT insertion) ----
+# scan_cg_en is internal to the clock-gate cell; only test_en_i is exposed here.
+set_false_path -from [get_ports test_en_i] -quiet
 
 # ---- Clock-gate bypass note ----
 # cv32e40p_clock_gate is a direct passthrough (hw/asic/cv32e40p_clock_gate_asic.sv);
