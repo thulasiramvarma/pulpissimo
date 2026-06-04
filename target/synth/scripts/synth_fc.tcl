@@ -115,14 +115,29 @@ puts "\[synth_fc\] MMMC loaded: SS/0.81V/125°C (setup), FF/0.99V/-40°C (hold)"
 
 # ════════════════════════════════════════════════════════════════
 # Step 7 — Elaborate fc_subsystem
-# Parameters match pulp_soc/rtl/pulp_soc.sv instantiation defaults.
 # ════════════════════════════════════════════════════════════════
+# Genus -parameters takes SPACE-separated {name value} pairs, NOT
+# name=value. Using '=' makes Genus emit an invalid wrapper like
+# "fc_subsystem #(CORE_TYPE=0)" → "Reference to undeclared variable
+# CORE_TYPE". The correct form below produces #(.CORE_TYPE(0)).
+#
+# Lean configuration: no FPU, no XPULP, no HWPE, no perf counters.
 puts "\[synth_fc\] Elaborating $TOP_MODULE ..."
 elaborate $TOP_MODULE \
-    -parameters {CORE_TYPE=0 USE_XPULP=1 USE_FPU=1 USE_ZFINX=1 \
-                 USE_HWPE=1 NB_HWPE_PORTS=4 PULP_SECURE=1 \
-                 N_EXT_PERF_COUNTERS=1 EVENT_ID_WIDTH=8 PER_ID_WIDTH=32 \
-                 CORE_ID=0 CLUSTER_ID=31}
+    -parameters { \
+        CORE_TYPE           0 \
+        USE_XPULP           0 \
+        USE_FPU             0 \
+        USE_ZFINX           0 \
+        USE_HWPE            0 \
+        NB_HWPE_PORTS       1 \
+        PULP_SECURE         1 \
+        N_EXT_PERF_COUNTERS 0 \
+        EVENT_ID_WIDTH      8 \
+        PER_ID_WIDTH        32 \
+        CORE_ID             0 \
+        CLUSTER_ID          31 \
+    }
 
 # Attach MMMC to the elaborated design
 init_design -top $TOP_MODULE
