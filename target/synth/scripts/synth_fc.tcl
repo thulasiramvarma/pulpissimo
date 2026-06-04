@@ -72,14 +72,22 @@ puts "\[synth_fc\] Reading HDL sources from bender_sources.tcl ..."
 source $SCRIPT_DIR/bender_sources.tcl
 
 # ════════════════════════════════════════════════════════════════
-# Step 5 — MMMC constraint structure  (corners / views / SDC)
+# Step 5 — SDC file path  (consumed by mmmc_fc.tcl)
 # ════════════════════════════════════════════════════════════════
-# mmmc_fc.tcl references the library sets created in Step 2.
+# Declared here so all file references are owned by this script.
+# mmmc_fc.tcl reads $FC_SDC when creating the constraint mode.
+set FC_SDC $SCRIPT_DIR/constraints_fc.sdc
+puts "\[synth_fc\] SDC : $FC_SDC"
+
+# ════════════════════════════════════════════════════════════════
+# Step 6 — MMMC constraint structure  (corners / views)
+# ════════════════════════════════════════════════════════════════
+# mmmc_fc.tcl references library sets (Step 2) and $FC_SDC (Step 5).
 source $SCRIPT_DIR/mmmc_fc.tcl
 puts "\[synth_fc\] MMMC loaded: SS/0.81V/125°C (setup), FF/0.99V/-40°C (hold)"
 
 # ════════════════════════════════════════════════════════════════
-# Step 6 — Elaborate fc_subsystem
+# Step 7 — Elaborate fc_subsystem
 # Parameters match pulp_soc/rtl/pulp_soc.sv instantiation defaults.
 # ════════════════════════════════════════════════════════════════
 puts "\[synth_fc\] Elaborating $TOP_MODULE ..."
@@ -93,7 +101,7 @@ elaborate $TOP_MODULE \
 init_design -top $TOP_MODULE
 
 # ════════════════════════════════════════════════════════════════
-# Step 7 — syn_generic  (technology-independent)
+# Step 8 — syn_generic  (technology-independent)
 # ════════════════════════════════════════════════════════════════
 puts "\[synth_fc\] syn_generic ..."
 syn_generic
@@ -104,7 +112,7 @@ report_timing -nworst 10  > $REPORT_DIR/fc_timing_generic.rpt
 puts "\[synth_fc\] Generic done — check $REPORT_DIR/fc_timing_generic.rpt for WNS"
 
 # ════════════════════════════════════════════════════════════════
-# Step 8 — syn_map  (map to standard cells)
+# Step 9 — syn_map  (map to standard cells)
 # ════════════════════════════════════════════════════════════════
 puts "\[synth_fc\] syn_map ..."
 syn_map
@@ -115,13 +123,13 @@ report_area               > $REPORT_DIR/fc_area_map.rpt
 puts "\[synth_fc\] Map done — check $REPORT_DIR/fc_area_map.rpt for cell count"
 
 # ════════════════════════════════════════════════════════════════
-# Step 9 — syn_opt  (post-map optimization)
+# Step 10 — syn_opt  (post-map optimization)
 # ════════════════════════════════════════════════════════════════
 puts "\[synth_fc\] syn_opt ..."
 syn_opt
 
 # ════════════════════════════════════════════════════════════════
-# Step 10 — Final reports
+# Step 11 — Final reports
 # ════════════════════════════════════════════════════════════════
 puts "\[synth_fc\] Writing final reports ..."
 report_qor                                > $REPORT_DIR/fc_qor_final.rpt
@@ -142,7 +150,7 @@ if {$wns < 0} {
 }
 
 # ════════════════════════════════════════════════════════════════
-# Step 11 — Write outputs
+# Step 12 — Write outputs
 # ════════════════════════════════════════════════════════════════
 puts "\[synth_fc\] Writing netlist ..."
 file mkdir $NETLIST_DIR
