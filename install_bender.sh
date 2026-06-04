@@ -41,7 +41,14 @@ export PATH="$HOME/.cargo/bin:$PATH"
 # ------------------------------------------------------------------ #
 echo "[2/3] Building bender v${BENDER_VERSION} from source..."
 echo "      (first build takes 5-10 min)"
-cargo install bender
+
+# Uninstall any existing bender version to avoid conflicts
+if cargo install --list | grep -q "^bender"; then
+    echo "      Removing existing bender installation..."
+    cargo uninstall bender
+fi
+
+cargo install bender --version ${BENDER_VERSION}
 
 echo ""
 echo "[3/3] Verifying installation..."
