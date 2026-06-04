@@ -68,8 +68,15 @@ set_db init_lef_files [list $TECH_LEF $CELL_LEF]
 # ════════════════════════════════════════════════════════════════
 # Step 4 — RTL search paths + read HDL
 # ════════════════════════════════════════════════════════════════
+# The cv32e40p include path MUST be globally visible before any file
+# that uses "import cv32e40p_apu_core_pkg::*" is parsed — specifically
+# fc_subsystem.sv. bender_sources.tcl sets it only for the cv32e40p
+# read_hdl block, then resets it. By setting it here globally we
+# guarantee it is always in scope when fc_subsystem is parsed.
 set_db init_hdl_search_path [list \
     $DESIGN_ROOT/hw/includes \
+    $DESIGN_ROOT/.bender/git/checkouts/cv32e40p-703290f15a6e8974/rtl/include \
+    $DESIGN_ROOT/.bender/git/checkouts/pulp_soc-b7e7c62781de8fd8/rtl/include \
 ]
 
 puts "\[synth_fc\] Reading HDL sources from bender_sources.tcl ..."
