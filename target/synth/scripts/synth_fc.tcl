@@ -93,6 +93,19 @@ puts "\[synth_fc\] Reading HDL sources ..."
 source $SCRIPT_DIR/bender_sources.tcl
 
 # ════════════════════════════════════════════════════════════════
+# Step 7b — ASIC-specific cells NOT in the reverted Bender.yml
+# cv32e40p instantiates cv32e40p_clock_gate (33x: register-file CGs +
+# core sleep CG). bender_sources.tcl includes neither the behavioral
+# nor the ASIC version, so without this read those become blackboxes.
+# hw/asic/cv32e40p_clock_gate_asic.sv is a pass-through (clk_o = clk_i)
+# — replace with a foundry ICG cell when power-gating is needed.
+# ════════════════════════════════════════════════════════════════
+puts "\[synth_fc\] Reading ASIC clock-gate cell ..."
+read_hdl -language sv \
+    -define {TARGET_GENUS TARGET_SYNTHESIS} \
+    [list $DESIGN_ROOT/hw/asic/cv32e40p_clock_gate_asic.sv]
+
+# ════════════════════════════════════════════════════════════════
 # Step 8 — MMMC  (corners + analysis views)
 # ════════════════════════════════════════════════════════════════
 set FC_SDC $SCRIPT_DIR/constraints_fc.sdc
