@@ -68,16 +68,32 @@ set_db init_lef_files [list $TECH_LEF $CELL_LEF]
 # ════════════════════════════════════════════════════════════════
 # Step 4 — RTL search paths + read HDL
 # ════════════════════════════════════════════════════════════════
-# The cv32e40p include path MUST be globally visible before any file
-# that uses "import cv32e40p_apu_core_pkg::*" is parsed — specifically
-# fc_subsystem.sv. bender_sources.tcl sets it only for the cv32e40p
-# read_hdl block, then resets it. By setting it here globally we
-# guarantee it is always in scope when fc_subsystem is parsed.
-set_db init_hdl_search_path [list \
+# bender_sources.tcl checks: "if [info exists search_path] { set
+# search_path_initial $search_path } else { set search_path_initial {} }"
+# and then does "set search_path $search_path_initial" before every
+# read_hdl block — so set_db init_hdl_search_path alone is not enough;
+# we must set the Tcl variable 'search_path' so bender picks it up as
+# search_path_initial and our paths survive every reset inside it.
+set search_path [list \
     $DESIGN_ROOT/hw/includes \
     $DESIGN_ROOT/.bender/git/checkouts/cv32e40p-703290f15a6e8974/rtl/include \
     $DESIGN_ROOT/.bender/git/checkouts/pulp_soc-b7e7c62781de8fd8/rtl/include \
 ]
+set_db init_hdl_search_path $search_path
+
+# Pre-read cv32e40p_apu_core_pkg explicitly BEFORE bender_sources.tcl.
+# fc_subsystem.sv has "import cv32e40p_apu_core_pkg::*" in its module
+# header. If this package is not already compiled when fc_subsystem.sv
+# is parsed, Genus silently drops the parameter block → elaborate fails
+# with "CORE_TYPE not declared". Explicit pre-read guarantees ordering.
+puts "\[synth_fc\] Pre-reading cv32e40p_apu_core_pkg ..."
+set CV32E40P_INC $DESIGN_ROOT/.bender/git/checkouts/cv32e40p-703290f15a6e8974/rtl/include
+read_hdl -language sv \
+    -define {TARGET_GENUS TARGET_SYNTHESIS} \
+    [list \
+        $CV32E40P_INC/cv32e40p_apu_core_pkg.sv \
+        $CV32E40P_INC/cv32e40p_pkg.sv \
+    ]
 
 puts "\[synth_fc\] Reading HDL sources from bender_sources.tcl ..."
 source $SCRIPT_DIR/bender_sources.tcl
