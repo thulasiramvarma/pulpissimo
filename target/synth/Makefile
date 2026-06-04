@@ -25,7 +25,11 @@ REPORT_DIR    := $(CURDIR)/reports/$(BLOCK)
 NETLIST_DIR   := $(CURDIR)/netlists
 
 # Bender targets for ASIC synthesis
-BENDER_TARGETS := -t asic -t synthesis
+# Bender targets. Plain 'bender script genus' auto-adds TARGET_GENUS +
+# TARGET_SYNTHESIS, which is what produces the full pulpissimo source list
+# (FC, pulp_soc, soc_domain, pulpissimo top). Leave empty to match that output.
+# Add '-t asic' only once the ASIC source blocks are restored in Bender.yml.
+BENDER_TARGETS :=
 
 .PHONY: all synth bender_sources synth_all clean help
 
@@ -33,11 +37,13 @@ all: synth
 
 ## Generate Bender source list for Genus.
 ## Run once after 'bender update' in the repo root.
+## Produces the same complete list as: bender script genus > genus_syn.tcl
 bender_sources:
 	mkdir -p $(SCRIPT_DIR)
 	cd ../../ && $(BENDER) script genus $(BENDER_TARGETS) \
 		> $(SCRIPT_DIR)/bender_sources.tcl
-	@# Fix bender 0.28.x genus template bugs: '{{' '}}' braces and 'set X = "..."'
+	@# Safety net: fix bender genus template bugs seen on some 0.28.x builds
+	@# ('{{'/'}}' braces and 'set ROOT = "..."'). No-op on clean output.
 	@sed -i -e 's/{{/{/g' -e 's/}}/}/g' \
 		-e 's/^set ROOT = "/set ROOT "/' \
 		$(SCRIPT_DIR)/bender_sources.tcl
