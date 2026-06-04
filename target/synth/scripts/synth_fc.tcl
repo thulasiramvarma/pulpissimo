@@ -9,85 +9,128 @@
 ## How to run:
 ##   genus -f target/synth/scripts/synth_fc.tcl
 ##
-## Outputs land in:
-##   target/synth/netlists/fc_netlist.v   (mapped gate netlist)
-##   target/synth/netlists/fc.sdc         (back-annotated constraints)
-##   target/synth/netlists/fc.sdf         (SDF for gate-level sim)
-##   target/synth/reports/fc/             (timing / area / power)
+## This file owns ALL library (.lib/.lef) reading and RTL reading.
+## mmmc_fc.tcl owns ONLY the MMMC constraint structure (corners/views).
 
-set BLOCK      fc
-set TOP_MODULE fc_subsystem
-set SCRIPT_DIR [file dirname [info script]]
-set REPORT_DIR $SCRIPT_DIR/../reports/$BLOCK
+set BLOCK       fc
+set TOP_MODULE  fc_subsystem
+set SCRIPT_DIR  [file dirname [info script]]
+set REPORT_DIR  $SCRIPT_DIR/../reports/$BLOCK
 set NETLIST_DIR $SCRIPT_DIR/../netlists
 
-# ───────────────────────────────────────────────────────────────
-# Step 1 — PDK / library / MMMC setup
-# ───────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════
+# Step 1 — Foundry PDK paths   (EDIT THESE for your process node)
+# ════════════════════════════════════════════════════════════════
+# STD_CELL_LIB must contain per-corner sub-directories of .lib files:
+#     $STD_CELL_LIB/ss_0v81_125c/*.lib
+#     $STD_CELL_LIB/ff_0v99_m40c/*.lib
+#     $STD_CELL_LIB/tt_0v9_25c/*.lib
+# LEF_DIR must contain the technology + std-cell .lef files.
+set FOUNDRY_ROOT   "/path/to/foundry/pdk"
+set STD_CELL_LIB   "$FOUNDRY_ROOT/stdcells"
+set LEF_DIR        "$FOUNDRY_ROOT/lef"
+
+# Design root (two levels up from this script)
+set DESIGN_ROOT    [file normalize $SCRIPT_DIR/../../..]
+
+# ════════════════════════════════════════════════════════════════
+# Step 2 — Library reading  (.lib timing libraries)
+# ════════════════════════════════════════════════════════════════
+# Library sets are the only PDK-dependent objects mmmc_fc.tcl references
+# by name (libs_ss / libs_ff / libs_tt). They are created here so all
+# .lib invocation lives in one place.
+puts "\[synth_fc\] Reading timing libraries from $STD_CELL_LIB ..."
+
+create_library_set -name libs_ss \
+    -timing  [glob $STD_CELL_LIB/ss_0v81_125c/*.lib] \
+    -library [glob $STD_CELL_LIB/ss_0v81_125c/*.lib]
+
+create_library_set -name libs_ff \
+    -timing  [glob $STD_CELL_LIB/ff_0v99_m40c/*.lib] \
+    -library [glob $STD_CELL_LIB/ff_0v99_m40c/*.lib]
+
+create_library_set -name libs_tt \
+    -timing  [glob $STD_CELL_LIB/tt_0v9_25c/*.lib] \
+    -library [glob $STD_CELL_LIB/tt_0v9_25c/*.lib]
+
+# ════════════════════════════════════════════════════════════════
+# Step 3 — Physical library reading  (.lef for area/congestion-aware syn)
+# ════════════════════════════════════════════════════════════════
+# Optional but recommended for physically-aware synthesis. Comment out
+# if you only want a logical (wireload) run.
+puts "\[synth_fc\] Reading LEF from $LEF_DIR ..."
+set_db init_lef_files [glob $LEF_DIR/*.lef] -quiet
+
+# ════════════════════════════════════════════════════════════════
+# Step 4 — RTL search paths + read HDL
+# ════════════════════════════════════════════════════════════════
+set_db init_hdl_search_path [list \
+    $DESIGN_ROOT/hw/includes \
+]
+
+puts "\[synth_fc\] Reading HDL sources from bender_sources.tcl ..."
+source $SCRIPT_DIR/bender_sources.tcl
+
+# ════════════════════════════════════════════════════════════════
+# Step 5 — MMMC constraint structure  (corners / views / SDC)
+# ════════════════════════════════════════════════════════════════
+# mmmc_fc.tcl references the library sets created in Step 2.
 source $SCRIPT_DIR/mmmc_fc.tcl
 puts "\[synth_fc\] MMMC loaded: SS/0.81V/125°C (setup), FF/0.99V/-40°C (hold)"
 
-# ───────────────────────────────────────────────────────────────
-# Step 2 — Read HDL
-# Source the full bender-generated list (all deps of fc_subsystem
-# are included); Genus only compiles what elaborate() actually needs.
-# ───────────────────────────────────────────────────────────────
-puts "\[synth_fc\] Reading HDL sources from bender_sources.tcl..."
-source $SCRIPT_DIR/bender_sources.tcl
-
-# ───────────────────────────────────────────────────────────────
-# Step 3 — Elaborate fc_subsystem
+# ════════════════════════════════════════════════════════════════
+# Step 6 — Elaborate fc_subsystem
 # Parameters match pulp_soc/rtl/pulp_soc.sv instantiation defaults.
-# ───────────────────────────────────────────────────────────────
-puts "\[synth_fc\] Elaborating $TOP_MODULE..."
+# ════════════════════════════════════════════════════════════════
+puts "\[synth_fc\] Elaborating $TOP_MODULE ..."
 elaborate $TOP_MODULE \
     -parameters {CORE_TYPE=0 USE_XPULP=1 USE_FPU=1 USE_ZFINX=1 \
                  USE_HWPE=1 NB_HWPE_PORTS=4 PULP_SECURE=1 \
                  N_EXT_PERF_COUNTERS=1 EVENT_ID_WIDTH=8 PER_ID_WIDTH=32 \
                  CORE_ID=0 CLUSTER_ID=31}
 
-# Attach MMMC after elaboration
+# Attach MMMC to the elaborated design
 init_design -top $TOP_MODULE
 
-# ───────────────────────────────────────────────────────────────
-# Step 4 — syn_generic  (technology-independent)
-# ───────────────────────────────────────────────────────────────
-puts "\[synth_fc\] syn_generic..."
+# ════════════════════════════════════════════════════════════════
+# Step 7 — syn_generic  (technology-independent)
+# ════════════════════════════════════════════════════════════════
+puts "\[synth_fc\] syn_generic ..."
 syn_generic
 
 file mkdir $REPORT_DIR
-report_qor    > $REPORT_DIR/fc_qor_generic.rpt
-report_timing -nworst 10 > $REPORT_DIR/fc_timing_generic.rpt
+report_qor                > $REPORT_DIR/fc_qor_generic.rpt
+report_timing -nworst 10  > $REPORT_DIR/fc_timing_generic.rpt
 puts "\[synth_fc\] Generic done — check $REPORT_DIR/fc_timing_generic.rpt for WNS"
 
-# ───────────────────────────────────────────────────────────────
-# Step 5 — syn_map  (map to standard cells)
-# ───────────────────────────────────────────────────────────────
-puts "\[synth_fc\] syn_map..."
+# ════════════════════════════════════════════════════════════════
+# Step 8 — syn_map  (map to standard cells)
+# ════════════════════════════════════════════════════════════════
+puts "\[synth_fc\] syn_map ..."
 syn_map
 
-report_qor    > $REPORT_DIR/fc_qor_map.rpt
-report_timing -nworst 10 > $REPORT_DIR/fc_timing_map.rpt
-report_area   > $REPORT_DIR/fc_area_map.rpt
+report_qor                > $REPORT_DIR/fc_qor_map.rpt
+report_timing -nworst 10  > $REPORT_DIR/fc_timing_map.rpt
+report_area               > $REPORT_DIR/fc_area_map.rpt
 puts "\[synth_fc\] Map done — check $REPORT_DIR/fc_area_map.rpt for cell count"
 
-# ───────────────────────────────────────────────────────────────
-# Step 6 — syn_opt  (post-map optimization)
-# ───────────────────────────────────────────────────────────────
-puts "\[synth_fc\] syn_opt..."
+# ════════════════════════════════════════════════════════════════
+# Step 9 — syn_opt  (post-map optimization)
+# ════════════════════════════════════════════════════════════════
+puts "\[synth_fc\] syn_opt ..."
 syn_opt
 
-# ───────────────────────────────────────────────────────────────
-# Step 7 — Final reports
-# ───────────────────────────────────────────────────────────────
-puts "\[synth_fc\] Writing final reports..."
-report_qor                                       > $REPORT_DIR/fc_qor_final.rpt
-report_timing -nworst 20                         > $REPORT_DIR/fc_timing_final.rpt
-report_area                                      > $REPORT_DIR/fc_area_final.rpt
-report_power                                     > $REPORT_DIR/fc_power_final.rpt
-report_cell                                      > $REPORT_DIR/fc_cells.rpt
-report_timing -check_type setup -nworst 5        > $REPORT_DIR/fc_setup_paths.rpt
-report_timing -check_type hold  -nworst 5        > $REPORT_DIR/fc_hold_paths.rpt
+# ════════════════════════════════════════════════════════════════
+# Step 10 — Final reports
+# ════════════════════════════════════════════════════════════════
+puts "\[synth_fc\] Writing final reports ..."
+report_qor                                > $REPORT_DIR/fc_qor_final.rpt
+report_timing -nworst 20                  > $REPORT_DIR/fc_timing_final.rpt
+report_area                               > $REPORT_DIR/fc_area_final.rpt
+report_power                              > $REPORT_DIR/fc_power_final.rpt
+report_cell                               > $REPORT_DIR/fc_cells.rpt
+report_timing -check_type setup -nworst 5 > $REPORT_DIR/fc_setup_paths.rpt
+report_timing -check_type hold  -nworst 5 > $REPORT_DIR/fc_hold_paths.rpt
 
 # Quick pass/fail summary to stdout
 set wns [get_db [get_timing_paths -view setup_view -nworst 1] .slack]
@@ -98,16 +141,16 @@ if {$wns < 0} {
     puts "\[synth_fc\] Setup timing MET"
 }
 
-# ───────────────────────────────────────────────────────────────
-# Step 8 — Write outputs
-# ───────────────────────────────────────────────────────────────
-puts "\[synth_fc\] Writing netlist..."
+# ════════════════════════════════════════════════════════════════
+# Step 11 — Write outputs
+# ════════════════════════════════════════════════════════════════
+puts "\[synth_fc\] Writing netlist ..."
 file mkdir $NETLIST_DIR
 
-write_hdl                      > $NETLIST_DIR/fc_netlist.v
-write_sdf -version 3.0         > $NETLIST_DIR/fc.sdf
-write_sdc                      > $NETLIST_DIR/fc.sdc
-write_db                         $NETLIST_DIR/fc.db
+write_hdl              > $NETLIST_DIR/fc_netlist.v
+write_sdf -version 3.0 > $NETLIST_DIR/fc.sdf
+write_sdc              > $NETLIST_DIR/fc.sdc
+write_db                 $NETLIST_DIR/fc.db
 
 puts "\[synth_fc\] ─────────────────────────────────────────────"
 puts "\[synth_fc\] COMPLETE"
