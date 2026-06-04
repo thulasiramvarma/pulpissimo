@@ -25,10 +25,12 @@ set NETLIST_DIR $SCRIPT_DIR/../netlists
 #     $STD_CELL_LIB/ss_0v81_125c/*.lib
 #     $STD_CELL_LIB/ff_0v99_m40c/*.lib
 #     $STD_CELL_LIB/tt_0v9_25c/*.lib
-# LEF_DIR must contain the technology + std-cell .lef files.
+# TECH_LEF : technology LEF (layers, vias, design rules) — read FIRST.
+# CELL_LEF : standard-cell LEF (cell abstracts) — read AFTER tech LEF.
 set FOUNDRY_ROOT   "/path/to/foundry/pdk"
 set STD_CELL_LIB   "$FOUNDRY_ROOT/stdcells"
-set LEF_DIR        "$FOUNDRY_ROOT/lef"
+set TECH_LEF       "$FOUNDRY_ROOT/lef/tech.lef"
+set CELL_LEF       "$FOUNDRY_ROOT/lef/stdcells.lef"
 
 # Design root (two levels up from this script)
 set DESIGN_ROOT    [file normalize $SCRIPT_DIR/../../..]
@@ -58,8 +60,10 @@ create_library_set -name libs_tt \
 # ════════════════════════════════════════════════════════════════
 # Optional but recommended for physically-aware synthesis. Comment out
 # if you only want a logical (wireload) run.
-puts "\[synth_fc\] Reading LEF from $LEF_DIR ..."
-set_db init_lef_files [glob $LEF_DIR/*.lef] -quiet
+# ORDER MATTERS: technology LEF must precede the std-cell LEF, since the
+# cell abstracts reference layers/vias defined in the tech LEF.
+puts "\[synth_fc\] Reading LEF: $TECH_LEF (tech), $CELL_LEF (cells) ..."
+set_db init_lef_files [list $TECH_LEF $CELL_LEF]
 
 # ════════════════════════════════════════════════════════════════
 # Step 4 — RTL search paths + read HDL
