@@ -128,6 +128,24 @@ elaborate $TOP_MODULE
 init_design -top $TOP_MODULE
 
 # ════════════════════════════════════════════════════════════════
+# Step 9b — Apply SDC explicitly
+# init_design does NOT reliably read the constraint-mode SDC in this
+# Genus version (symptom: report_qor says "No clock. There are no
+# clocks in the design" → unconstrained synthesis). Reading the SDC
+# here — AFTER elaborate/init_design when ports like clk_i exist —
+# guarantees create_clock and all constraints are applied.
+# ════════════════════════════════════════════════════════════════
+puts "\[synth_fc\] Applying SDC constraints ..."
+read_sdc $FC_SDC
+
+# Sanity check: abort early if no clock was created.
+if {[llength [get_db clocks]] == 0} {
+    error "\[synth_fc\] No clocks defined after read_sdc — check that\
+ 'clk_i' exists as a port of fc_subsystem and constraints_fc.sdc loaded."
+}
+puts "\[synth_fc\] Clocks defined: [get_db clocks .name]"
+
+# ════════════════════════════════════════════════════════════════
 # Step 10 — syn_generic
 # ════════════════════════════════════════════════════════════════
 puts "\[synth_fc\] syn_generic ..."
