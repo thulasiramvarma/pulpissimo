@@ -160,7 +160,7 @@ report_qor                                > $REPORT_DIR/fc_qor_final.rpt
 report_timing -nworst 20                  > $REPORT_DIR/fc_timing_final.rpt
 report_area                               > $REPORT_DIR/fc_area_final.rpt
 report_power                              > $REPORT_DIR/fc_power_final.rpt
-report_cell                               > $REPORT_DIR/fc_cells.rpt
+report_gates                              > $REPORT_DIR/fc_cells.rpt
 report_timing -check_type setup -nworst 5 > $REPORT_DIR/fc_setup_paths.rpt
 report_timing -check_type hold  -nworst 5 > $REPORT_DIR/fc_hold_paths.rpt
 
